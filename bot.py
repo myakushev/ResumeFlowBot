@@ -1,16 +1,18 @@
 import os
-import telebot
 import time
+import json
+from io import BytesIO
+from collections import defaultdict
+
+import telebot
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton
 from dotenv import load_dotenv
 from mistralai import Mistral
-from collections import defaultdict
-from telebot.types import ReplyKeyboardMarkup, KeyboardButton
-from io import BytesIO
+
+# from resume_renderer import render_resume_html, html_to_pdf_bytes
 
 # ---------- Session storage ----------
-user_sessions = defaultdict(lambda: {
-    "texts": [],
-})
+user_sessions = defaultdict(lambda: {"texts": []})
 
 # ---------- Load env ----------
 load_dotenv()
@@ -20,64 +22,89 @@ MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 TELEGRAM_MESSAGE_LIMIT = 4000
-COVER_LETTER_MAX_CHARS = 800
+COVER_LETTER_MAX_CHARS = 1200
 
-# ---------- Prompts ----------
-RESUME_PROMPT = """
-You are a professional resume formatter.
-Input: {user_text}
+# ---------- Prompt ----------
+RESUME_JSON_PROMPT = f"""
+You are a professional resume analyst and career coach.
 
-Output a structured Markdown resume with these fields:
-- Full Name
-- Title
-- Summary
-- Skills (bullet list)
-- Experience (company, role, period, achievements)
-- Education
-- Languages
-- Contacts
+INPUT (raw user messages):
+{{user_text}}
 
-Do not invent any facts. Use only the information from the user.
-"""
+GOAL:
+Return a SINGLE valid JSON object with:
+1) Structured resume data (for future PDF rendering)
+2) A ready-to-send Markdown resume (for Telegram message/file)
+3) A short cover letter (plain text)
 
-COVER_LETTER_PROMPT = f"""
-You are a professional career coach.
-Input: {{user_text}}
+STRICT RULES:
+- Output MUST be only valid JSON. No Markdown outside JSON. No comments. No explanations.
+- Do NOT invent facts. Use only input data.
+- If something is missing, use empty string "" or empty array [].
+- resume_markdown must be readable and well-structured (headings, bullet lists).
+- cover_letter: 3–5 sentences, professional tone, plain text (no markdown), max {COVER_LETTER_MAX_CHARS} characters.
 
-Write a short cover letter for a job application.
-Rules:
-- 3–5 sentences
-- Maximum {COVER_LETTER_MAX_CHARS} characters
-- Clear, professional tone
-- No markdown, plain text only
-"""
+JSON SCHEMA (exact keys):
+{{
+  "resume_data": {{
+    "full_name": "",
+    "title": "",
+    "summary": "",
+    "contacts": {{
+      "phone": "",
+      "email": "",
+      "telegram": "",
+      "linkedin": "",
+      "location": ""
+    }},
+    "skills": [],
+    "experience": [
+      {{
+        "company": "",
+        "location": "",
+        "role": "",
+        "period": "",
+        "responsibilities": [],
+        "achievements": [],
+        "tech_stack": []
+      }}
+    ],
+    "education": [
+      {{
+        "institution": "",
+        "location": "",
+        "degree": "",
+        "field": "",
+        "year": ""
+      }}
+    ],
+    "certifications": [],
+    "languages": []
+  }},
+  "resume_markdown": "",
+  "cover_letter": ""
+}}
+""".strip()
 
-# ---------- Mistral API ----------
 def call_mistral(prompt: str) -> str:
+    with Mistral(api_key=MISTRAL_API_KEY) as mistral:
+        resp = mistral.chat.complete(
+            model="mistral-small-latest",
+            messages=[{"role": "user", "content": prompt}],
+            stream=False
+        )
+        return resp.choices[0].message.content
+
+def extract_json(text: str) -> dict:
     """
-    Генерация текста через Mistral SDK.
-    Возвращает текст ассистента.
+    Достаёт первый JSON-объект из строки.
+    Нужен на случай, если модель вдруг добавит лишние символы вокруг JSON.
     """
-    try:
-        with Mistral(api_key=MISTRAL_API_KEY) as mistral:
-            response = mistral.chat.complete(
-                model="mistral-small-latest",
-                messages=[{"role": "user", "content": prompt}],
-                stream=False
-            )
-
-            print("[MISTRAL FULL RESPONSE OBJ]")
-            print(response)
-
-            if hasattr(response, "model_dump_json"):
-                print("[MISTRAL RESPONSE JSON]")
-                print(response.model_dump_json())
-
-            return response.choices[0].message.content
-
-    except Exception as e:
-        print(f"[MISTRAL ERROR] {e}")
-        return "⚠️ Ошибка генерации. Попробуйте снова."
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("No JSON object found in model output")
+    return json.loads(text[start:end + 1])
 
 # ---------- Keyboard ----------
 def generate_keyboard():
@@ -93,58 +120,54 @@ def generate_keyboard():
 def start(message):
     bot.send_message(
         message.chat.id,
-        "👋 Welcome to ResumeFlow!\n\n"
-        "Send your experience or resume text.\n"
-        "You can send multiple messages.\n\n"
+        "Welcome to ResumeFlow!\n\n"
+        "Send your experience/resume text in single or multiple messages.\n"
         "When finished, press «✅ Сгенерировать резюме».",
         reply_markup=generate_keyboard()
     )
-    print(f"[BOT] User {message.from_user.id} started the bot.")
 
-@bot.message_handler(func=lambda message: message.text not in [
-    "✅ Сгенерировать резюме",
-    "❌ Очистить ввод"
-])
+@bot.message_handler(func=lambda m: m.text not in ["✅ Сгенерировать резюме", "❌ Очистить ввод"])
 def collect_text(message):
     user_id = message.from_user.id
-    chat_id = message.chat.id
-    text = message.text.strip()
-
+    print(f"New message from {user_id}: {message.text}")
+    text = (message.text or "").strip()
     if not text:
         return
 
     user_sessions[user_id]["texts"].append(text)
 
+    # --- ДОБАВЛЯЕМ СТРОКУ ДЛЯ ОТЛАДКИ ---
+    print("--- Текущее состояние user_sessions ---")
+    print(user_sessions)
+    print("------------------------------------")
+
     bot.send_message(
-        chat_id,
-        "✍️ Текст добавлен. Можете отправить ещё или нажмите «Сгенерировать резюме».",
+        message.chat.id,
+        "Текст добавлен. Можете отправить ещё или нажмите «Сгенерировать резюме».",
         reply_markup=generate_keyboard()
     )
 
-    print(f"[BOT] Collected text chunk from user {user_id}")
-
-@bot.message_handler(func=lambda message: message.text == "❌ Очистить ввод")
+@bot.message_handler(func=lambda m: m.text == "❌ Очистить ввод")
 def clear_input(message):
     user_id = message.from_user.id
-    chat_id = message.chat.id
-
     user_sessions[user_id]["texts"].clear()
+    bot.send_message(message.chat.id, "Ввод очищен.", reply_markup=generate_keyboard())
 
-    bot.send_message(
-        chat_id,
-        "🧹 Ввод очищен. Можете начать заново.",
-        reply_markup=generate_keyboard()
-    )
+def wrap_markdown_code_block(md: str) -> str:
+    """
+    Оборачивает Markdown-текст в code block для Telegram.
+    Если внутри есть ``` — лучше не слать как блок (сломает разметку).
+    """
+    if "```" in md:
+        return ""
+    return f"```markdown\n{md}\n```"
 
-    print(f"[BOT] Cleared session for user {user_id}")
-
-@bot.message_handler(func=lambda message: message.text == "✅ Сгенерировать резюме")
+@bot.message_handler(func=lambda m: m.text == "✅ Сгенерировать резюме")
 def generate_resume(message):
     user_id = message.from_user.id
     chat_id = message.chat.id
 
     texts = user_sessions[user_id]["texts"]
-
     if not texts:
         bot.send_message(chat_id, "⚠️ Вы ещё не отправили данные.")
         return
@@ -153,45 +176,54 @@ def generate_resume(message):
 
     bot.send_message(chat_id, "⏳ Генерирую резюме и сопроводительное письмо…")
 
-    print(f"[BOT] Generating resume for user {user_id}")
+    try:
+        # 1) Один вызов LLM → один JSON
+        prompt = RESUME_JSON_PROMPT.replace("{user_text}", full_text)
+        raw = call_mistral(prompt)
+        payload = extract_json(raw)
 
-    resume_markdown = call_mistral(
-        RESUME_PROMPT.format(user_text=full_text)
-    )
+        resume_markdown = (payload.get("resume_markdown") or "").strip()
+        cover_letter = (payload.get("cover_letter") or "").strip()
 
-    cover_letter = call_mistral(
-        COVER_LETTER_PROMPT.format(user_text=full_text)
-    )
+        # На будущее: структурные данные для PDF/шаблона
+        resume_data = payload.get("resume_data") or {}
 
-    # ---------- Send resume ----------
-    if len(resume_markdown) > TELEGRAM_MESSAGE_LIMIT:
-        file_buffer = BytesIO(resume_markdown.encode("utf-8"))
-        file_buffer.name = "resume.md"
+        # 2) Отправка резюме: либо файлом, либо как markdown в code block
+        if not resume_markdown:
+            bot.send_message(chat_id, "⚠️ Не удалось получить resume_markdown из JSON.")
+        else:
+            code_block = wrap_markdown_code_block(resume_markdown)
 
-        bot.send_document(
-            chat_id,
-            file_buffer,
-            caption="📄 Your resume (Markdown file)"
-        )
+            # Если есть ``` внутри — блок сломается, отправим файлом
+            if not code_block:
+                file_buffer = BytesIO(resume_markdown.encode("utf-8"))
+                file_buffer.name = "resume.md"
+                bot.send_document(chat_id, file_buffer, caption="📄 Your resume (Markdown file)")
+            else:
+                # Учитываем заголовок + обрамление code block
+                message_text = f"📄 *Your Resume (Markdown)*\n\n{code_block}"
 
-        print(f"[BOT] Resume sent as file to user {user_id}")
-    else:
-        bot.send_message(
-            chat_id,
-            f"📄 *Your Resume (Markdown)*\n\n{resume_markdown}",
-            parse_mode="Markdown"
-        )
+                if len(message_text) > TELEGRAM_MESSAGE_LIMIT:
+                    file_buffer = BytesIO(resume_markdown.encode("utf-8"))
+                    file_buffer.name = "resume.md"
+                    bot.send_document(chat_id, file_buffer, caption="📄 Your resume (Markdown file)")
+                else:
+                    bot.send_message(chat_id, message_text, parse_mode="Markdown")
 
-    # ---------- Send cover letter (always text) ----------
-    bot.send_message(
-        chat_id,
-        f"✉️ *Short Cover Letter*\n\n{cover_letter}",
-        parse_mode="Markdown"
-    )
+        # 3) Отправка cover letter (лучше plain text, без parse_mode)
+        if cover_letter:
+            bot.send_message(chat_id, f"✉️ Short Cover Letter\n\n{cover_letter}")
 
-    user_sessions[user_id]["texts"].clear()
+        # Debug (опционально)
+        print("[RESUME_DATA STRUCT]")
+        print(json.dumps(resume_data, ensure_ascii=False, indent=2))
 
-    print(f"[BOT] Sent resume and cover letter to user {user_id}")
+    except Exception as e:
+        print(f"[GENERATE_RESUME ERROR] {e}")
+        bot.send_message(chat_id, "⚠️ Ошибка генерации. Попробуйте снова.")
+
+    finally:
+        user_sessions[user_id]["texts"].clear()
 
 # ---------- Stable polling ----------
 def run_bot():
