@@ -1,0 +1,6 @@
+pyTelegramBotAPI
+python-dotenv
+mistralai
+Jinja2
+playwright
+PySocks

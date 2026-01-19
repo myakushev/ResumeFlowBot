@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  resume-bot:
+    build: .
+    container_name: resume_flow_bot
+    env_file:
+      - .env
+    restart: unless-stopped
+    depends_on:
+      - proxy
+    networks:
+      - bot-net
+
+  proxy:
+    image: serjs/go-socks5-proxy
+    container_name: socks5_proxy
+    restart: unless-stopped
+    environment:
+      # <<< ИЗМЕНЕНО: Добавляем эту строку, чтобы отключить аутентификацию
+      - REQUIRE_AUTH=false
+      - PROXY_PORT=1080
+    networks:
+      - bot-net
+
+networks:
+  bot-net:
+    driver: bridge
